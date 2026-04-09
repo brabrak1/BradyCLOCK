@@ -57,6 +57,9 @@ CORAL_BORDER = (232, 213, 207)  # #E8D5CF
 LAVENDER = (139, 127, 181)    # #8B7FB5
 LAVENDER_PASTEL = (245, 243, 250)  # #F5F3FA
 
+# SmashRun
+SMASHRUN_TOKEN = "smashrun_token.json"
+
 # Google Calendar
 CALENDAR_CREDENTIALS = "client_secret.json"
 CALENDAR_TOKEN = "token.json"
