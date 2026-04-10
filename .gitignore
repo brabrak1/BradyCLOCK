@@ -1,5 +1,7 @@
 client_secret.json
 token.json
+smashrun_token.json
+.env
 __pycache__/
 *.pyc
 .DS_Store
