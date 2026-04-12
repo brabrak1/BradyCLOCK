@@ -2,17 +2,17 @@
 """BradyCLOCK — Raspberry Pi smart desk clock."""
 
 import os
-import struct
+import select as select_mod
 import sys
 import time
+
+import numpy as np
 
 # Detect Pi: /dev/fb1 exists
 IS_PI = os.path.exists("/dev/fb1")
 
 if IS_PI:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-    os.environ.setdefault("SDL_MOUSEDEV", "/dev/input/touchscreen")
-    os.environ.setdefault("SDL_MOUSEDRV", "TSLIB")
 
 import pygame
 import config
@@ -26,17 +26,36 @@ from screens.calendar_view import CalendarScreen
 def push_to_fb(surface, fb):
     """Convert a pygame surface to RGB565 and write it to the framebuffer."""
     pixels = pygame.image.tostring(surface, "RGB")
-    rgb565 = bytearray(config.SCREEN_WIDTH * config.SCREEN_HEIGHT * 2)
-    idx = 0
-    for i in range(0, len(pixels), 3):
-        r = pixels[i]
-        g = pixels[i + 1]
-        b = pixels[i + 2]
-        rgb565[idx] = ((g & 0x1C) << 3) | (b >> 3)
-        rgb565[idx + 1] = (r & 0xF8) | (g >> 5)
-        idx += 2
+    arr = np.frombuffer(pixels, dtype=np.uint8).reshape(-1, 3)
+    r = arr[:, 0].astype(np.uint16)
+    g = arr[:, 1].astype(np.uint16)
+    b = arr[:, 2].astype(np.uint16)
+    rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
     fb.seek(0)
-    fb.write(rgb565)
+    fb.write(rgb565.astype("<u2").tobytes())
+
+
+def find_touchscreen():
+    """Find the touchscreen evdev device on the Pi."""
+    try:
+        from evdev import InputDevice, ecodes, list_devices
+    except ImportError:
+        return None
+
+    for path in list_devices():
+        dev = InputDevice(path)
+        caps = dev.capabilities()
+        if ecodes.EV_ABS in caps:
+            name = dev.name.lower()
+            if "touch" in name or "ads7846" in name or "tsc" in name:
+                return dev
+    # Fallback: return first device with ABS capability
+    for path in list_devices():
+        dev = InputDevice(path)
+        caps = dev.capabilities()
+        if ecodes.EV_ABS in caps:
+            return dev
+    return None
 
 
 def draw_nav_dots(surface, current, total):
@@ -67,12 +86,28 @@ def main():
     pygame.init()
 
     fb = None
+    touch_dev = None
+    touch_x = None      # X position at finger down
+    touch_x_last = None  # Most recent X position
+
     if IS_PI:
-        # Dummy driver requires a display mode to be set for fonts/events
+        from evdev import ecodes
+
+        print(f"Pi mode: SDL_VIDEODRIVER={os.environ.get('SDL_VIDEODRIVER')}")
         pygame.display.set_mode((1, 1))
         screen = pygame.Surface((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
-        fb = open("/dev/fb1", "wb")
+        print(f"Surface created: {screen.get_size()}")
+        fb = open("/dev/fb1", "wb", buffering=0)
+        # Push a white frame immediately to confirm fb1 works
+        screen.fill((255, 255, 255))
+        push_to_fb(screen, fb)
+        print("Framebuffer: wrote initial white frame to /dev/fb1")
         pygame.mouse.set_visible(False)
+        touch_dev = find_touchscreen()
+        if touch_dev:
+            print(f"Touchscreen found: {touch_dev.name} ({touch_dev.path})")
+        else:
+            print("Warning: No touchscreen device found")
     else:
         screen = pygame.display.set_mode(
             (config.SCREEN_WIDTH, config.SCREEN_HEIGHT)
@@ -103,6 +138,7 @@ def main():
 
     try:
         while running:
+            # Pygame events (keyboard on desktop, quit)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -122,6 +158,29 @@ def main():
                     elif delta < -config.SWIPE_THRESHOLD:
                         current_screen = (current_screen - 1) % config.NUM_SCREENS
                     swipe_start_x = None
+
+            # Evdev touch events (Pi only)
+            if touch_dev:
+                r, _, _ = select_mod.select([touch_dev], [], [], 0)
+                if r:
+                    for event in touch_dev.read():
+                        if event.type == ecodes.EV_ABS and event.code == ecodes.ABS_X:
+                            touch_x_last = event.value
+                            if touch_x is None:
+                                touch_x = event.value
+                        elif event.type == ecodes.EV_KEY and event.code == ecodes.BTN_TOUCH:
+                            if event.value == 1:
+                                # Finger down
+                                touch_x = None
+                            elif event.value == 0 and touch_x is not None and touch_x_last is not None:
+                                # Finger up — check swipe
+                                delta = touch_x - touch_x_last
+                                if abs(delta) > config.SWIPE_THRESHOLD:
+                                    if delta > 0:
+                                        current_screen = (current_screen + 1) % config.NUM_SCREENS
+                                    else:
+                                        current_screen = (current_screen - 1) % config.NUM_SCREENS
+                                touch_x = None
 
             # Periodic updates (every 30 seconds, check all screens)
             now = time.time()
@@ -146,11 +205,18 @@ def main():
             draw_swipe_hint(screen)
 
             if fb:
-                push_to_fb(screen, fb)
+                try:
+                    push_to_fb(screen, fb)
+                except Exception as e:
+                    print(f"Framebuffer write error: {e}")
             else:
                 pygame.display.flip()
 
             clock.tick(config.FPS)
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         if fb:
             fb.close()
